@@ -782,6 +782,334 @@ func TestMainImpl_InvalidPath(t *testing.T) {
 	}
 }
 
+// --- RAR Tests (Phase: RED — will fail until RAR support is implemented) ---
+
+func TestIsRarFile(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		{"roms.rar", true},
+		{"roms.RAR", true},
+		{"roms.Rar", true},
+		{"roms.zip", false},
+		{"roms.7z", false},
+		{"roms.txt", false},
+		{"roms.rar.part", false},
+		{"roms.rar.crdownload", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := isRarFile(tt.path); got != tt.expected {
+				t.Errorf("isRarFile(%q) = %v, want %v", tt.path, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsArchive(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		{"roms.zip", true},
+		{"roms.rar", true},
+		{"roms.ZIP", true},
+		{"roms.RAR", true},
+		{"roms.7z", false},
+		{"roms.txt", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := isArchive(tt.path); got != tt.expected {
+				t.Errorf("isArchive(%q) = %v, want %v", tt.path, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractRar(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-rar")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	rarPath := filepath.Join(tmpDir, "test.rar")
+	createTestRar(t, rarPath, map[string]string{
+		"game.gba":     "fake gba content",
+		"game.nds":     "fake nds content",
+		"readme.txt":   "this is not a rom",
+		"sub/game.3ds": "nested 3ds rom",
+	})
+
+	destDir := filepath.Join(tmpDir, "extracted")
+	files, err := extractRar(rarPath, destDir)
+	if err != nil {
+		t.Fatalf("extractRar failed: %v", err)
+	}
+
+	if len(files) != 4 {
+		t.Errorf("extractRar returned %d files, want 4", len(files))
+	}
+
+	for _, f := range files {
+		if _, err := os.Stat(f); os.IsNotExist(err) {
+			t.Errorf("extracted file %q does not exist", f)
+		}
+	}
+}
+
+func TestExtractRar_SlipPrevention(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-rarslip")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	rarPath := filepath.Join(tmpDir, "evil.rar")
+	createTestRarSlip(t, rarPath, "../../../evil.exe", []byte("malicious"))
+
+	destDir := filepath.Join(tmpDir, "extracted")
+	files, err := extractRar(rarPath, destDir)
+	if err != nil {
+		t.Fatalf("extractRar failed: %v", err)
+	}
+
+	for _, file := range files {
+		if !isWithinDir(file, destDir) {
+			t.Errorf("rar-slip detected: %q escaped %q", file, destDir)
+		}
+	}
+}
+
+func TestExtractRar_InvalidRar(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-rarinvalid")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	badRar := filepath.Join(tmpDir, "bad.rar")
+	if err := os.WriteFile(badRar, []byte("not a rar file"), 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	destDir := filepath.Join(tmpDir, "extracted")
+	_, err = extractRar(badRar, destDir)
+	if err == nil {
+		t.Error("expected error for invalid rar")
+	}
+}
+
+func TestExtractRar_NonExistentRar(t *testing.T) {
+	_, err := extractRar("nonexistent.rar", "dest")
+	if err == nil {
+		t.Error("expected error for non-existent rar")
+	}
+}
+
+func TestProcessArchive_IntegrationRar(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-archive-rar")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for _, d := range []string{"GBA", "NDS", "3DS"} {
+		os.MkdirAll(filepath.Join(tmpDir, d), 0755)
+	}
+
+	rarPath := filepath.Join(tmpDir, "collection.rar")
+	createTestRar(t, rarPath, map[string]string{
+		"mario.gba":      "mario rom",
+		"zelda.nds":      "zelda rom",
+		"pokemon.3ds":    "pokemon rom",
+		"fireemblem.cia": "fire emblem rom",
+		"manual.pdf":     "not a rom",
+	})
+
+	if err := processArchive(rarPath, tmpDir); err != nil {
+		t.Fatalf("processArchive (rar) failed: %v", err)
+	}
+
+	checkFileNotExists(t, rarPath)
+	checkFileExists(t, filepath.Join(tmpDir, "GBA", "mario.gba"))
+	checkFileExists(t, filepath.Join(tmpDir, "NDS", "zelda.nds"))
+	checkFileExists(t, filepath.Join(tmpDir, "3DS", "pokemon.3ds"))
+	checkFileExists(t, filepath.Join(tmpDir, "3DS", "fireemblem.cia"))
+	checkFileNotExists(t, filepath.Join(tmpDir, "GBA", "manual.pdf"))
+}
+
+func TestRun_MixedArchives(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-mixedarch")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for _, d := range []string{"GBA", "NDS", "3DS"} {
+		os.MkdirAll(filepath.Join(tmpDir, d), 0755)
+	}
+
+	createTestZip(t, filepath.Join(tmpDir, "gba_games.zip"), map[string]string{
+		"fireemblem.gba": "fe rom",
+	})
+	createTestRar(t, filepath.Join(tmpDir, "nds_games.rar"), map[string]string{
+		"mariokart.nds": "mk rom",
+	})
+	os.WriteFile(filepath.Join(tmpDir, "ignored.7z"), []byte("not supported"), 0644)
+
+	if err := run(tmpDir); err != nil {
+		t.Fatalf("run (mixed archives) failed: %v", err)
+	}
+
+	checkFileExists(t, filepath.Join(tmpDir, "GBA", "fireemblem.gba"))
+	checkFileExists(t, filepath.Join(tmpDir, "NDS", "mariokart.nds"))
+	checkFileNotExists(t, filepath.Join(tmpDir, "gba_games.zip"))
+	checkFileNotExists(t, filepath.Join(tmpDir, "nds_games.rar"))
+	checkFileExists(t, filepath.Join(tmpDir, "ignored.7z"))
+}
+
+func TestRun_NoArchivesFound(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter-noarch")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	os.WriteFile(filepath.Join(tmpDir, "game.7z"), []byte("unsupported"), 0644)
+
+	if err := run(tmpDir); err != nil {
+		t.Errorf("run with no supported archives should not error, got: %v", err)
+	}
+}
+
+// --- RAR Test Helpers ---
+
+// createTestRar builds a minimal RAR v4 archive (store mode) with the given files.
+// RAR is proprietary; this creates valid-but-minimal archives for testing extraction.
+func createTestRar(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("failed to create test rar: %v", err)
+	}
+	defer out.Close()
+
+	// RAR v4 marker block (7 bytes)
+	marker := []byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00}
+	out.Write(marker)
+
+	// Archive header (type 0x73)
+	writeRarArchiveHeader(out)
+
+	for name, content := range files {
+		writeRarFileHeader(out, name, []byte(content))
+	}
+
+	// End of archive header (type 0x7b)
+	writeRarTerminator(out)
+}
+
+func writeRarArchiveHeader(out *os.File) {
+	// RAR v4 archive header block (type 0x73)
+	// Header size: 7 + 6 = 13 bytes
+	headCRC := uint16(0) // simplified — real CRC would be computed
+	headType := byte(0x73)
+	headFlags := uint16(0) // no password, no comment
+	headSize := uint16(7)  // base header only
+
+	buf := []byte{
+		byte(headCRC), byte(headCRC >> 8),
+		headType,
+		byte(headFlags), byte(headFlags >> 8),
+		byte(headSize), byte(headSize >> 8),
+	}
+	out.Write(buf)
+}
+
+func writeRarFileHeader(out *os.File, name string, data []byte) {
+	// RAR v4 file header (type 0x74), store mode
+	nameBytes := []byte(name)
+	// base header (7) + compressed size (4) + uncompressed size (4) + OS (1) + CRC (4) + time (4) + version (1) + method (1) + name size (2) + attributes (4)
+	headSize := 7 + 4 + 4 + 1 + 4 + 4 + 1 + 1 + 2 + 4
+	// Round up to even? For simplicity, use computed size.
+	fullHeadSize := headSize + len(nameBytes)
+	// RAR requires name+header to be padded to even if needed (simplified: skip padding if not needed)
+
+	// CRC of header bytes from type to name (simplified to 0)
+	headCRC := uint16(0)
+	headType := byte(0x74)
+	// Flags: bit9=LONG_BLOCK not set; bit15=not directory
+	headFlags := uint16(0x8000) // FILE_HEADER flag
+
+	buf := make([]byte, 0, fullHeadSize)
+
+	// Write CRC (2), type (1), flags (2), size (2) = 7 bytes base + fixed fields
+	putUint16 := func(b []byte, v uint16) {
+		b[0] = byte(v)
+		b[1] = byte(v >> 8)
+	}
+	putUint32 := func(b []byte, v uint32) {
+		b[0] = byte(v)
+		b[1] = byte(v >> 8)
+		b[2] = byte(v >> 16)
+		b[3] = byte(v >> 24)
+	}
+
+	hdr := make([]byte, fullHeadSize)
+	putUint16(hdr[0:2], headCRC)
+	hdr[2] = headType
+	putUint16(hdr[3:5], headFlags)
+	putUint16(hdr[5:7], uint16(fullHeadSize))
+	// Packed size (4 bytes) — same as data length for store
+	putUint32(hdr[7:11], uint32(len(data)))
+	// Unpacked size (4 bytes)
+	putUint32(hdr[11:15], uint32(len(data)))
+	// Host OS: 2 = Windows
+	hdr[15] = 2
+	// File CRC (4 bytes) — simplified to 0
+	putUint32(hdr[16:20], 0) // unused in store mode
+	// File time (4 bytes) — DOS format, set to a known value
+	putUint32(hdr[20:24], 0x4A000000) // some valid DOS time
+	// RAR version needed: 29 (RAR 2.0)
+	hdr[24] = 29
+	// Method: 0x30 = storing
+	hdr[25] = 0x30
+	// Name size (2 bytes)
+	putUint16(hdr[26:28], uint16(len(nameBytes)))
+	// File attributes (4 bytes)
+	putUint32(hdr[28:32], 0x20) // archive attribute
+
+	copy(hdr[32:], nameBytes)
+
+	buf = append(buf, hdr...)
+	out.Write(buf)
+	out.Write(data)
+}
+
+func writeRarTerminator(out *os.File) {
+	// End of archive block (type 0x7b)
+	buf := []byte{0x00, 0x00, 0x7b, 0x00, 0x40, 0x07, 0x00}
+	out.Write(buf)
+}
+
+func createTestRarSlip(t *testing.T, path string, evilName string, content []byte) {
+	t.Helper()
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("failed to create slip rar: %v", err)
+	}
+	defer out.Close()
+
+	marker := []byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00}
+	out.Write(marker)
+	writeRarArchiveHeader(out)
+	writeRarFileHeader(out, evilName, content)
+	writeRarTerminator(out)
+}
+
 // --- Helpers ---
 
 func createTestZip(t *testing.T, path string, files map[string]string) {

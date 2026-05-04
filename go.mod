@@ -1,3 +1,5 @@
 module rom-sorter
 
 go 1.22
+
+require github.com/nwaples/rardecode/v2 v2.2.2 // indirect
