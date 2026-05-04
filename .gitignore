@@ -1,2 +1,9 @@
 /rom-sorter.exe
 /.opencode
+*.rar
+/GBA/
+/NDS/
+/3DS/
+/DS/
+/tmp/
+/coverage.out
