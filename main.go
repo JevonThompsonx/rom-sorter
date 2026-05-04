@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/nwaples/rardecode/v2"
 )
 
 const (
@@ -39,6 +41,14 @@ func isROM(filename string) (string, bool) {
 
 func isZipFile(path string) bool {
 	return strings.ToLower(filepath.Ext(path)) == ".zip"
+}
+
+func isRarFile(path string) bool {
+	return strings.ToLower(filepath.Ext(path)) == ".rar"
+}
+
+func isArchive(path string) bool {
+	return isZipFile(path) || isRarFile(path)
 }
 
 func sanitizePath(path string) string {
@@ -210,6 +220,136 @@ func extractZip(zipPath, destDir string) ([]string, error) {
 	return extracted, nil
 }
 
+func extractRar(rarPath, destDir string) ([]string, error) {
+	reader, err := rardecode.OpenReader(rarPath)
+	if err != nil {
+		return nil, fmt.Errorf("open rar %q: %w", rarPath, err)
+	}
+	defer reader.Close()
+
+	absDestDir, err := filepath.Abs(destDir)
+	if err != nil {
+		return nil, fmt.Errorf("abs dest dir: %w", err)
+	}
+
+	var extracted []string
+	var totalSize int64
+
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return extracted, fmt.Errorf("read rar entry: %w", err)
+		}
+
+		// Skip symlinks, devices, and other non-regular files
+		if header.Mode()&os.ModeSymlink != 0 || !header.Mode().IsRegular() && !header.IsDir {
+			continue
+		}
+
+		safeName := sanitizePath(header.Name)
+		if safeName == "" || safeName == "." {
+			continue
+		}
+
+		destPath := filepath.Join(destDir, safeName)
+
+		absDestPath, err := filepath.Abs(destPath)
+		if err != nil {
+			return extracted, fmt.Errorf("abs dest path %q: %w", destPath, err)
+		}
+		if !isWithinDir(absDestPath, absDestDir) {
+			continue
+		}
+
+		if header.IsDir {
+			if err := os.MkdirAll(destPath, 0755); err != nil {
+				return extracted, fmt.Errorf("mkdir %q: %w", destPath, err)
+			}
+			continue
+		}
+
+		// RAR doesn't always report uncompressed size upfront
+		uncompressedSize := int64(header.UnPackedSize)
+		if uncompressedSize > 0 && uncompressedSize > maxZipEntrySize {
+			return extracted, fmt.Errorf("rar entry %q too large: %d bytes (max %d)", header.Name, uncompressedSize, maxZipEntrySize)
+		}
+		if totalSize+uncompressedSize > maxTotalExtract {
+			return extracted, fmt.Errorf("total extraction size exceeds limit of %d bytes", maxTotalExtract)
+		}
+		totalSize += uncompressedSize
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return extracted, fmt.Errorf("mkdir parent %q: %w", filepath.Dir(destPath), err)
+		}
+
+		outFile, err := os.Create(destPath)
+		if err != nil {
+			return extracted, fmt.Errorf("create %q: %w", destPath, err)
+		}
+
+		_, copyErr := io.CopyN(outFile, reader, uncompressedSize)
+		closeErr := outFile.Close()
+
+		if copyErr != nil {
+			os.Remove(destPath)
+			return extracted, fmt.Errorf("write %q: %w", destPath, copyErr)
+		}
+		if closeErr != nil {
+			os.Remove(destPath)
+			return extracted, fmt.Errorf("close %q: %w", destPath, closeErr)
+		}
+
+		extracted = append(extracted, destPath)
+	}
+
+	return extracted, nil
+}
+
+func processArchive(archivePath, baseDir string) error {
+	tmpDir, err := os.MkdirTemp("", "rom-sorter")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	os.Chmod(tmpDir, 0700)
+	defer os.RemoveAll(tmpDir)
+
+	var files []string
+	if isZipFile(archivePath) {
+		files, err = extractZip(archivePath, tmpDir)
+	} else if isRarFile(archivePath) {
+		files, err = extractRar(archivePath, tmpDir)
+	} else {
+		return fmt.Errorf("unsupported archive format: %s", archivePath)
+	}
+	if err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+
+	for _, file := range files {
+		filename := filepath.Base(file)
+		folder, isROM := isROM(filename)
+		if !isROM {
+			continue
+		}
+
+		destDir := filepath.Join(baseDir, folder)
+		destPath := filepath.Join(destDir, filename)
+
+		if err := moveFile(file, destPath); err != nil {
+			return fmt.Errorf("move %q to %q: %w", filename, destDir, err)
+		}
+	}
+
+	if err := os.Remove(archivePath); err != nil {
+		return fmt.Errorf("remove archive %q: %w", archivePath, err)
+	}
+
+	return nil
+}
+
 func processZip(zipPath, baseDir string) error {
 	tmpDir, err := os.MkdirTemp("", "rom-sorter")
 	if err != nil {
@@ -257,12 +397,12 @@ func run(baseDir string) error {
 		if entry.IsDir() {
 			continue
 		}
-		if !isZipFile(entry.Name()) {
+		if !isArchive(entry.Name()) {
 			continue
 		}
-		zipPath := filepath.Join(baseDir, entry.Name())
+		archivePath := filepath.Join(baseDir, entry.Name())
 		fmt.Printf("Processing: %s\n", entry.Name())
-		if err := processZip(zipPath, baseDir); err != nil {
+		if err := processArchive(archivePath, baseDir); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", entry.Name(), err))
 			fmt.Printf("  ERROR: %v\n", err)
 			continue
@@ -272,7 +412,7 @@ func run(baseDir string) error {
 	}
 
 	if processed == 0 {
-		fmt.Printf("No .zip files found in %s\n", baseDir)
+		fmt.Printf("No archives (.zip/.rar) found in %s\n", baseDir)
 	}
 
 	if len(errs) > 0 {
@@ -287,7 +427,7 @@ func mainImpl(dir string) error {
 	if err != nil {
 		return fmt.Errorf("resolve path: %w", err)
 	}
-	fmt.Printf("ROM Sorter - Scanning %s for .zip files\n", absDir)
+	fmt.Printf("ROM Sorter - Scanning %s for archives (.zip/.rar)\n", absDir)
 	if err := run(absDir); err != nil {
 		return err
 	}

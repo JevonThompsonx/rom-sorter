@@ -128,8 +128,8 @@ func TestExe_IgnoresNonZipFiles(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Create non-zip files
-	os.WriteFile(filepath.Join(tmpDir, "game.rar"), []byte("rar content"), 0644)
+	// Create non-archive files
+	os.WriteFile(filepath.Join(tmpDir, "game.7z"), []byte("unsupported format"), 0644)
 	os.WriteFile(filepath.Join(tmpDir, "readme.txt"), []byte("text"), 0644)
 
 	cmd := exec.Command(exePath, tmpDir)
@@ -267,8 +267,8 @@ func TestExe_HandlesEmptyDirectory(t *testing.T) {
 	}
 
 	out := string(output)
-	if !strings.Contains(out, "No .zip files found") {
-		t.Errorf("expected 'No .zip files found' for empty dir, got: %s", out)
+	if !strings.Contains(out, "No archives") {
+		t.Errorf("expected 'No archives' for empty dir, got: %s", out)
 	}
 }
 

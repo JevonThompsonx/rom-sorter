@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -704,7 +705,7 @@ func TestRun_MixedContent(t *testing.T) {
 		"mariokart.nds": "mk rom",
 	})
 
-	os.WriteFile(filepath.Join(tmpDir, "ignored.rar"), []byte("not a zip"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "ignored.7z"), []byte("not supported"), 0644)
 
 	if err := run(tmpDir); err != nil {
 		t.Fatalf("run failed: %v", err)
@@ -716,7 +717,7 @@ func TestRun_MixedContent(t *testing.T) {
 
 	checkFileNotExists(t, filepath.Join(tmpDir, "gba_games.zip"))
 	checkFileNotExists(t, filepath.Join(tmpDir, "nds_games.zip"))
-	checkFileExists(t, filepath.Join(tmpDir, "ignored.rar"))
+	checkFileExists(t, filepath.Join(tmpDir, "ignored.7z"))
 }
 
 func TestRun_WithInvalidZip(t *testing.T) {
@@ -988,7 +989,6 @@ func TestRun_NoArchivesFound(t *testing.T) {
 // --- RAR Test Helpers ---
 
 // createTestRar builds a minimal RAR v4 archive (store mode) with the given files.
-// RAR is proprietary; this creates valid-but-minimal archives for testing extraction.
 func createTestRar(t *testing.T, path string, files map[string]string) {
 	t.Helper()
 	out, err := os.Create(path)
@@ -997,102 +997,18 @@ func createTestRar(t *testing.T, path string, files map[string]string) {
 	}
 	defer out.Close()
 
-	// RAR v4 marker block (7 bytes)
-	marker := []byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00}
-	out.Write(marker)
+	// RAR v4 marker: "Rar!\x1A\x07\x00" (version 0 = 1.5-4.x format)
+	out.Write([]byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00})
 
 	// Archive header (type 0x73)
-	writeRarArchiveHeader(out)
+	writeRarBlock(out, 0x73, 0x0000, nil)
 
 	for name, content := range files {
-		writeRarFileHeader(out, name, []byte(content))
+		writeRarStoredFile(out, name, []byte(content))
 	}
 
-	// End of archive header (type 0x7b)
-	writeRarTerminator(out)
-}
-
-func writeRarArchiveHeader(out *os.File) {
-	// RAR v4 archive header block (type 0x73)
-	// Header size: 7 + 6 = 13 bytes
-	headCRC := uint16(0) // simplified — real CRC would be computed
-	headType := byte(0x73)
-	headFlags := uint16(0) // no password, no comment
-	headSize := uint16(7)  // base header only
-
-	buf := []byte{
-		byte(headCRC), byte(headCRC >> 8),
-		headType,
-		byte(headFlags), byte(headFlags >> 8),
-		byte(headSize), byte(headSize >> 8),
-	}
-	out.Write(buf)
-}
-
-func writeRarFileHeader(out *os.File, name string, data []byte) {
-	// RAR v4 file header (type 0x74), store mode
-	nameBytes := []byte(name)
-	// base header (7) + compressed size (4) + uncompressed size (4) + OS (1) + CRC (4) + time (4) + version (1) + method (1) + name size (2) + attributes (4)
-	headSize := 7 + 4 + 4 + 1 + 4 + 4 + 1 + 1 + 2 + 4
-	// Round up to even? For simplicity, use computed size.
-	fullHeadSize := headSize + len(nameBytes)
-	// RAR requires name+header to be padded to even if needed (simplified: skip padding if not needed)
-
-	// CRC of header bytes from type to name (simplified to 0)
-	headCRC := uint16(0)
-	headType := byte(0x74)
-	// Flags: bit9=LONG_BLOCK not set; bit15=not directory
-	headFlags := uint16(0x8000) // FILE_HEADER flag
-
-	buf := make([]byte, 0, fullHeadSize)
-
-	// Write CRC (2), type (1), flags (2), size (2) = 7 bytes base + fixed fields
-	putUint16 := func(b []byte, v uint16) {
-		b[0] = byte(v)
-		b[1] = byte(v >> 8)
-	}
-	putUint32 := func(b []byte, v uint32) {
-		b[0] = byte(v)
-		b[1] = byte(v >> 8)
-		b[2] = byte(v >> 16)
-		b[3] = byte(v >> 24)
-	}
-
-	hdr := make([]byte, fullHeadSize)
-	putUint16(hdr[0:2], headCRC)
-	hdr[2] = headType
-	putUint16(hdr[3:5], headFlags)
-	putUint16(hdr[5:7], uint16(fullHeadSize))
-	// Packed size (4 bytes) — same as data length for store
-	putUint32(hdr[7:11], uint32(len(data)))
-	// Unpacked size (4 bytes)
-	putUint32(hdr[11:15], uint32(len(data)))
-	// Host OS: 2 = Windows
-	hdr[15] = 2
-	// File CRC (4 bytes) — simplified to 0
-	putUint32(hdr[16:20], 0) // unused in store mode
-	// File time (4 bytes) — DOS format, set to a known value
-	putUint32(hdr[20:24], 0x4A000000) // some valid DOS time
-	// RAR version needed: 29 (RAR 2.0)
-	hdr[24] = 29
-	// Method: 0x30 = storing
-	hdr[25] = 0x30
-	// Name size (2 bytes)
-	putUint16(hdr[26:28], uint16(len(nameBytes)))
-	// File attributes (4 bytes)
-	putUint32(hdr[28:32], 0x20) // archive attribute
-
-	copy(hdr[32:], nameBytes)
-
-	buf = append(buf, hdr...)
-	out.Write(buf)
-	out.Write(data)
-}
-
-func writeRarTerminator(out *os.File) {
-	// End of archive block (type 0x7b)
-	buf := []byte{0x00, 0x00, 0x7b, 0x00, 0x40, 0x07, 0x00}
-	out.Write(buf)
+	// End of archive (type 0x7b)
+	writeRarBlock(out, 0x7b, 0x0000, nil)
 }
 
 func createTestRarSlip(t *testing.T, path string, evilName string, content []byte) {
@@ -1103,11 +1019,76 @@ func createTestRarSlip(t *testing.T, path string, evilName string, content []byt
 	}
 	defer out.Close()
 
-	marker := []byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00}
-	out.Write(marker)
-	writeRarArchiveHeader(out)
-	writeRarFileHeader(out, evilName, content)
-	writeRarTerminator(out)
+	out.Write([]byte{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00})
+	writeRarBlock(out, 0x73, 0x0000, nil)
+	writeRarStoredFile(out, evilName, content)
+	writeRarBlock(out, 0x7b, 0x0000, nil)
+}
+
+// rarBlockHeader writes a RAR v4 block header with correct CRC-32 checksum.
+// payload is the data after the 7-byte preamble (type, flags, size excluded).
+func writeRarBlock(out *os.File, blockType byte, flags uint16, payload []byte) {
+	// Total header size = 7 (preamble) + len(payload)
+	headerSize := uint16(7 + len(payload))
+
+	// Build the header data starting from type byte (for CRC computation)
+	// Type(1) + Flags(2) + Size(2) + Payload
+	crcData := make([]byte, 0, 5+len(payload))
+	crcData = append(crcData, blockType)
+	crcData = append(crcData, byte(flags), byte(flags>>8))
+	crcData = append(crcData, byte(headerSize), byte(headerSize>>8))
+	crcData = append(crcData, payload...)
+
+	// Compute CRC-32-IEEE and take bottom 16 bits
+	crc := crc32.ChecksumIEEE(crcData)
+	crc16 := uint16(crc) // lower 16 bits
+
+	// Write preamble: CRC(2) + Type(1) + Flags(2) + Size(2)
+	out.Write([]byte{byte(crc16), byte(crc16 >> 8), blockType, byte(flags), byte(flags >> 8), byte(headerSize), byte(headerSize >> 8)})
+	// Write payload
+	out.Write(payload)
+}
+
+// writeRarStoredFile writes a stored (uncompressed) RAR v4 file entry.
+func writeRarStoredFile(out *os.File, name string, data []byte) {
+	nameBytes := []byte(name)
+
+	// Build payload: PackedSize(4) + UnpackedSize(4) + HostOS(1) + FileCRC(4) +
+	//   DOS time(4) + UnpackVer(1) + Method(1) + NameSize(2) + Attributes(4) + Name
+	payload := make([]byte, 0, 25+len(nameBytes))
+
+	putLE32 := func(v uint32) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)} }
+
+	// Packed size (stored = uncompressed)
+	payload = append(payload, putLE32(uint32(len(data)))...)
+	// Unpacked size
+	payload = append(payload, putLE32(uint32(len(data)))...)
+	// Host OS: 2 = Windows (stored as value-1, so write 1)
+	payload = append(payload, 1)
+	// File CRC-32
+	fcrc := crc32.ChecksumIEEE(data)
+	payload = append(payload, putLE32(fcrc)...)
+	// DOS file time: 2024-01-01 12:00:00
+	// DOS time: bits 15-11=hour, 10-5=minute, 4-0=second/2
+	// DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
+	// 2024-01-01: date = (44<<9)|(1<<5)|1 = 0x5821; time = (12<<11)|0|0 = 0x6000
+	payload = append(payload, putLE32(0x58216000)...)
+	// Unpack version needed: 29 (RAR 2.9)
+	payload = append(payload, 29)
+	// Method: 0x30 = stored
+	payload = append(payload, 0x30)
+	// Name size
+	payload = append(payload, byte(len(nameBytes)), byte(len(nameBytes)>>8))
+	// File attributes: 0x20 = archive
+	payload = append(payload, putLE32(0x20)...)
+	// Filename
+	payload = append(payload, nameBytes...)
+
+	// Write file block header with blockHasData flag (0x8000)
+	writeRarBlock(out, 0x74, 0x8000, payload)
+
+	// Write file data immediately after
+	out.Write(data)
 }
 
 // --- Helpers ---
