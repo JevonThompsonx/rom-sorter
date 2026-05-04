@@ -28,6 +28,8 @@ func init() {
 
 var romFolders = map[string]string{
 	".gba": "GBA",
+	".gb":  "GBA",
+	".gbc": "GBA",
 	".nds": "NDS",
 	".3ds": "3DS",
 	".cia": "3DS",

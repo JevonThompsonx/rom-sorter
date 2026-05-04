@@ -16,6 +16,8 @@ func TestIsROM(t *testing.T) {
 	}{
 		{"game.gba", true, "GBA"},
 		{"game.GBA", true, "GBA"},
+		{"game.gb", true, "GBA"},
+		{"game.gbc", true, "GBA"},
 		{"game.nds", true, "NDS"},
 		{"game.NDS", true, "NDS"},
 		{"game.3ds", true, "3DS"},
